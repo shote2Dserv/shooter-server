@@ -1,16 +1,21 @@
 // server.js — WebSocket сервер для 2D Шутера
 // Работает на Render, Koyeb, Cyclic, Fly.io и любом Node.js-хостинге
+// ЛИМИТ: 5 игроков (хост + 4 клиента)
 
 const WebSocket = require('ws');
 
-// ВАЖНО: parseInt превращает строку в число (Render/Koyeb дают PORT как строку)
+// ВАЖНО: parseInt превращает строку в число
 const PORT = parseInt(process.env.PORT || 3000, 10);
 
 const wss = new WebSocket.Server({ port: PORT });
 
 console.log('🚀 Сервер запущен на порту', PORT);
 
-// Комнаты: { code: { host: ws, clients: [ws], createdAt, lastActivity } }
+// ============ КОНФИГ ============
+const MAX_PLAYERS = 5;           // ← ВСЕГО ИГРОКОВ (хост + 4 клиента)
+const MAX_CLIENTS = MAX_PLAYERS - 1; // хост не считается в room.clients
+
+// Комнаты: { code: { host, clients, players, createdAt, lastActivity } }
 const rooms = new Map();
 
 function generateRoomCode() {
@@ -52,6 +57,10 @@ function leaveRoom(ws) {
             const newHost = room.clients.shift();
             room.host = newHost;
             newHost._playerId = 'host';
+            if (room.players) {
+                delete room.players[newHost._playerId];
+                room.players['host'] = { id: 'host', nickname: newHost._nickname || 'Хост', isHost: true };
+            }
             broadcastToRoom(code, { type: 'host_changed', newHost: 'host' }, null);
             console.log(`👑 Хост передан в комнате ${code}`);
         } else {
@@ -60,6 +69,7 @@ function leaveRoom(ws) {
         }
     } else {
         room.clients = room.clients.filter(c => c !== ws);
+        if (room.players) delete room.players[ws._playerId];
         broadcastToRoom(code, { type: 'player_left', id: ws._playerId }, ws);
         console.log(`👋 Игрок ${ws._playerId} вышел из комнаты ${code}`);
     }
@@ -70,6 +80,7 @@ function leaveRoom(ws) {
 wss.on('connection', (ws) => {
     ws._roomCode = null;
     ws._playerId = null;
+    ws._nickname = null;
     ws._isAlive = true;
 
     console.log('🔌 Новое подключение');
@@ -89,14 +100,16 @@ wss.on('connection', (ws) => {
             const code = generateRoomCode();
             ws._roomCode = code;
             ws._playerId = 'host';
+            ws._nickname = String(msg.nickname || 'Хост').slice(0, 16);
             rooms.set(code, {
                 host: ws,
                 clients: [],
+                players: { host: { id: 'host', nickname: ws._nickname, isHost: true } },
                 createdAt: Date.now(),
                 lastActivity: Date.now(),
             });
-            sendTo(ws, { type: 'room_created', code, playerId: 'host' });
-            console.log(`🏠 Создана комната ${code}`);
+            sendTo(ws, { type: 'room_created', code, playerId: 'host', nickname: ws._nickname });
+            console.log(`🏠 Создана комната ${code} (хост: ${ws._nickname})`);
             return;
         }
 
@@ -109,20 +122,41 @@ wss.on('connection', (ws) => {
                 sendTo(ws, { type: 'error', message: 'Комната не найдена' });
                 return;
             }
-            if (room.clients.length >= 3) {
-                sendTo(ws, { type: 'error', message: 'Комната заполнена' });
+            // ⚠️ ПРОВЕРКА ЛИМИТА — 4 клиента максимум (хост + 4 = 5 игроков)
+            if (room.clients.length >= MAX_CLIENTS) {
+                sendTo(ws, { type: 'error', message: 'Комната заполнена (' + MAX_PLAYERS + ' игроков макс.)' });
                 return;
             }
             ws._roomCode = code;
             ws._playerId = 'p' + (room.clients.length + 1);
+            ws._nickname = String(msg.nickname || ws._playerId).slice(0, 16);
             room.clients.push(ws);
             room.lastActivity = Date.now();
 
-            sendTo(ws, { type: 'room_joined', code, playerId: ws._playerId });
-            sendTo(room.host, { type: 'player_joined', id: ws._playerId });
-            broadcastToRoom(code, { type: 'player_joined', id: ws._playerId }, ws);
+            if (!room.players) room.players = {};
+            room.players[ws._playerId] = { id: ws._playerId, nickname: ws._nickname, isHost: false };
 
-            console.log(`🎮 Игрок ${ws._playerId} подключился к комнате ${code}`);
+            sendTo(ws, {
+                type: 'room_joined',
+                code,
+                playerId: ws._playerId,
+                nickname: ws._nickname,
+                players: Object.values(room.players)
+            });
+            sendTo(room.host, {
+                type: 'player_joined',
+                id: ws._playerId,
+                nickname: ws._nickname,
+                players: Object.values(room.players)
+            });
+            broadcastToRoom(code, {
+                type: 'player_joined',
+                id: ws._playerId,
+                nickname: ws._nickname,
+                players: Object.values(room.players)
+            }, ws);
+
+            console.log(`🎮 Игрок ${ws._playerId} (${ws._nickname}) подключился к комнате ${code}. Всего: ${room.clients.length + 1}/${MAX_PLAYERS}`);
             return;
         }
 
@@ -132,7 +166,7 @@ wss.on('connection', (ws) => {
             return;
         }
 
-        // === ИГРОВЫЕ СООБЩЕНИЯ (релей) ===
+        // === РЕЛЕЙ ИГРОВЫХ СООБЩЕНИЙ ===
         if (ws._roomCode) {
             const room = rooms.get(ws._roomCode);
             if (room) {
@@ -166,7 +200,6 @@ setInterval(() => {
         try { ws.ping(); } catch (e) {}
     });
 
-    // Удаляем комнаты без активности > 30 мин
     const now = Date.now();
     for (const [code, room] of rooms.entries()) {
         if (now - room.lastActivity > 30 * 60 * 1000) {
